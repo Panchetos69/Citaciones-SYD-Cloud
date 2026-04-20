@@ -3,6 +3,7 @@ Monitor de Citaciones — Senado + Camara de Diputados
 =====================================================
 Modos:
   monitor  -> scraping cada 10 min, detecta cambios, notifica Telegram
+  inicios  -> revisa si hay sesiones priorizadas que empiecen en 5 min
   sheets   -> llena Google Sheets semanal, envia email con link (domingo 20:00)
   cerrar   -> lee prioridades del Sheets, genera PDF (lunes 01:00)
   reporte  -> envia PDF por Telegram a todos (lunes 09:00)
@@ -101,24 +102,26 @@ def _sheets_svc():
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
+def _get_chat_ids(db: firestore.Client) -> list:
+    try:
+        usuarios = db.collection("bot_usuarios").where("activo", "==", True).stream()
+        ids = [d.to_dict().get("chat_id") for d in usuarios]
+        return ids if ids else [TG_CHAT_ID]
+    except Exception:
+        return [TG_CHAT_ID]
+
+
 def _tg_texto(msg: str):
     try:
-        # Enviar a todos los usuarios activos
         db = firestore.Client(project=GCP_PROJECT)
-        usuarios = db.collection("bot_usuarios").where("activo", "==", True).stream()
-        chat_ids = [d.to_dict().get("chat_id") for d in usuarios]
-        
-        # Si no hay usuarios registrados, enviar solo al chat_id por defecto
-        if not chat_ids:
-            chat_ids = [TG_CHAT_ID]
-
+        chat_ids = _get_chat_ids(db)
         for chat_id in chat_ids:
             requests.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                 json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
                 timeout=10
             )
-        log.info(f"[Telegram] Mensaje enviado a {len(chat_ids)} usuarios")
+        log.info(f"[Telegram] Texto enviado a {len(chat_ids)} usuarios")
     except Exception as e:
         log.error(f"Error Telegram: {e}")
 
@@ -126,12 +129,7 @@ def _tg_texto(msg: str):
 def _tg_pdf(ruta: str, caption: str = ""):
     try:
         db = firestore.Client(project=GCP_PROJECT)
-        usuarios = db.collection("bot_usuarios").where("activo", "==", True).stream()
-        chat_ids = [d.to_dict().get("chat_id") for d in usuarios]
-        
-        if not chat_ids:
-            chat_ids = [TG_CHAT_ID]
-
+        chat_ids = _get_chat_ids(db)
         for chat_id in chat_ids:
             with open(ruta, "rb") as f:
                 requests.post(
@@ -143,6 +141,7 @@ def _tg_pdf(ruta: str, caption: str = ""):
         log.info(f"[Telegram] PDF enviado a {len(chat_ids)} usuarios")
     except Exception as e:
         log.error(f"Error Telegram PDF: {e}")
+
 
 # ── Email ──────────────────────────────────────────────────────────────────────
 def _enviar_email(destinatarios: list, asunto: str, cuerpo_html: str,
@@ -187,7 +186,6 @@ def parsear_fecha_camara(txt: str) -> str:
 
 
 def semana_actual() -> str:
-    """Si es fin de semana devuelve la semana proxima (ya publicada)."""
     hoy = datetime.now()
     if hoy.weekday() >= 4:
         prox_lunes = hoy + timedelta(days=(7 - hoy.weekday()))
@@ -198,7 +196,6 @@ def semana_actual() -> str:
 
 
 def semana_siguiente() -> str:
-    """Devuelve la semana subsiguiente."""
     hoy = datetime.now()
     if hoy.weekday() >= 4:
         prox_lunes = hoy + timedelta(days=(7 - hoy.weekday()))
@@ -305,23 +302,34 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
             "fecha": cit.fecha, "horario": cit.horario,
             "sala": cit.sala, "materia": cit.materia,
             "suspendida": cit.suspendida, "hash_contenido": nuevo_hash,
-            "prioridad": False, "creada_en": datetime.now(timezone.utc),
+            "prioridad": False, "inicio_notificado": False,
+            "creada_en": datetime.now(timezone.utc),
             "actualizada_en": datetime.now(timezone.utc),
         })
         return "nueva"
     datos = doc.to_dict()
     if nuevo_hash == datos.get("hash_contenido", ""):
         return "sin_cambios"
+
     horario_cambio   = cit.horario != datos.get("horario", "")
     sala_cambio      = cit.sala != datos.get("sala", "")
     suspendida_nueva = cit.suspendida and not datos.get("suspendida")
 
     if suspendida_nueva:
-        tipo = "suspendida"       # sesion cancelada
+        tipo = "suspendida"
     elif horario_cambio or sala_cambio:
-        tipo = "modificada"       # adelanto, atraso o cambio de sala
+        tipo = "modificada"
     else:
-        tipo = "sin_cambios"      # solo cambio de materia, no notificar
+        tipo = "sin_cambios"
+
+    ref.update({
+        "horario": cit.horario, "sala": cit.sala, "materia": cit.materia,
+        "suspendida": cit.suspendida, "hash_contenido": nuevo_hash,
+        "actualizada_en": datetime.now(timezone.utc),
+        "horario_anterior": datos.get("horario", ""),
+        # Si cambio el horario, resetear la notificacion de inicio
+        "inicio_notificado": False if horario_cambio else datos.get("inicio_notificado", False),
+    })
     return tipo
 
 
@@ -329,36 +337,100 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
 def notificar_nueva(cit: Citacion):
     emoji = "🏛" if cit.fuente == "senado" else "🏦"
     tema  = extraer_tema(cit.materia)
+    inst  = "Senado" if cit.fuente == "senado" else "Camara"
     msg   = (
-        f"🆕 <b>Nueva citacion</b>\n{'─'*28}\n"
+        f"🆕 <b>Nueva citacion — {inst}</b>\n{'─'*28}\n"
         f"{emoji} <b>{cit.comision}</b>\n"
         f"📅 {cit.fecha}  🕐 {cit.horario}\n"
         f"📍 {cit.sala[:60]}\n"
     )
     if tema:
-        msg += f"📌 {tema[:100]}"
+        msg += f"📌 {tema[:150]}"
     _tg_texto(msg)
 
 
 def notificar_cambio(cit: Citacion, tipo: str, horario_anterior: str = ""):
     emoji = "🏛" if cit.fuente == "senado" else "🏦"
+    inst  = "Senado" if cit.fuente == "senado" else "Camara"
     if tipo == "suspendida":
         msg = (
-            f"❌ <b>SUSPENDIDA</b>\n{'─'*28}\n"
+            f"❌ <b>Sesion SUSPENDIDA — {inst}</b>\n{'─'*28}\n"
             f"{emoji} <b>{cit.comision}</b>\n"
-            f"📅 {cit.fecha}  📍 {cit.sala[:50]}"
+            f"📅 {cit.fecha}  🕐 {cit.horario}\n"
+            f"📍 {cit.sala[:50]}"
         )
     else:
         cambio = ""
         if horario_anterior and horario_anterior != cit.horario:
-            cambio = f"\n⏰ <s>{horario_anterior}</s> → <b>{cit.horario}</b>"
+            cambio = f"\n⏰ Horario: <s>{horario_anterior}</s> → <b>{cit.horario}</b>"
         msg = (
-            f"⚠️ <b>Citacion modificada</b>\n{'─'*28}\n"
+            f"⚠️ <b>Citacion modificada — {inst}</b>\n{'─'*28}\n"
             f"{emoji} <b>{cit.comision}</b>\n"
             f"📅 {cit.fecha}{cambio}\n"
             f"📍 {cit.sala[:50]}"
         )
     _tg_texto(msg)
+
+
+# ── Notificador de inicios ─────────────────────────────────────────────────────
+def notificar_inicios(db: firestore.Client):
+    """
+    Corre cada minuto. Avisa cuando una sesion priorizada
+    esta por empezar (en los proximos 5 min) o empieza ahora.
+    Si el horario cambio, resetea inicio_notificado para volver a avisar.
+    """
+    ahora    = datetime.now()
+    hoy      = ahora.strftime("%Y-%m-%d")
+    desde    = ahora.hour * 60 + ahora.minute
+    hasta    = desde + 6  # ventana de 6 minutos
+
+    try:
+        docs = db.collection(FIRESTORE_COLECCION)\
+                 .where("fecha", "==", hoy)\
+                 .where("prioridad", "==", True)\
+                 .stream()
+    except Exception as e:
+        log.error(f"Error consultando Firestore: {e}")
+        return
+
+    for doc in docs:
+        c = doc.to_dict()
+        if c.get("suspendida"):
+            continue
+        if c.get("inicio_notificado"):
+            continue
+
+        horario = c.get("horario", "")
+        try:
+            hora_inicio = horario.split(" ")[0]
+            h, m        = map(int, hora_inicio.split(":"))
+            minutos     = h * 60 + m
+        except Exception:
+            continue
+
+        if desde <= minutos <= hasta:
+            emoji = "🏛" if c.get("fuente") == "senado" else "🏦"
+            inst  = "Senado" if c.get("fuente") == "senado" else "Camara"
+            tema  = extraer_tema(c.get("materia", ""))
+            mins_restantes = minutos - desde
+
+            if mins_restantes <= 1:
+                encabezado = f"🟢 <b>Sesion iniciando ahora — {inst}</b>"
+            else:
+                encabezado = f"⏰ <b>En {mins_restantes} min — {inst}</b>"
+
+            msg = (
+                f"{encabezado}\n{'─'*28}\n"
+                f"{emoji} <b>{c.get('comision','')}</b>\n"
+                f"🕐 {horario}\n"
+                f"📍 {c.get('sala','')[:60]}\n"
+            )
+            if tema:
+                msg += f"📌 {tema[:200]}"
+
+            _tg_texto(msg)
+            doc.reference.update({"inicio_notificado": True})
+            log.info(f"[INICIO] {c.get('comision','')} — {horario}")
 
 
 # ── Google Sheets semanal ──────────────────────────────────────────────────────
@@ -380,7 +452,6 @@ def llenar_sheets_semanal(db: firestore.Client):
     filas = []
     for c in cits:
         inst  = "Senado" if c.get("fuente") == "senado" else "Camara de Diputados"
-        tema  = extraer_tema(c.get("materia", ""))
         fecha = c.get("fecha", "")
         try:
             dt    = datetime.strptime(fecha, "%Y-%m-%d")
@@ -389,7 +460,8 @@ def llenar_sheets_semanal(db: firestore.Client):
         except Exception:
             pass
         filas.append(["NO", inst, c.get("comision", ""), fecha,
-                      c.get("horario", ""), c.get("sala", "")[:60], c.get("materia", "")[:800]])
+                      c.get("horario", ""), c.get("sala", "")[:60],
+                      c.get("materia", "")[:800]])
     svc.spreadsheets().values().update(
         spreadsheetId=SHEETS_ID_FIJO, range="A1",
         valueInputOption="RAW", body={"values": cabecera + filas}
@@ -452,7 +524,7 @@ def llenar_sheets_semanal(db: firestore.Client):
       <div style="background:#f9f9f9;padding:24px;border:1px solid #e0e0e0;">
         <p>Hola equipo,</p>
         <p>El sistema ha recopilado <b>{len(filas)} citaciones</b> para la semana.
-        Cambien <b>NO → SI</b> en la columna <b>PRIORIDAD</b> para marcar sesiones.</p>
+        Cambien <b>NO a SI</b> en la columna <b>PRIORIDAD</b> para marcar sesiones.</p>
         <div style="text-align:center;margin:30px 0;">
           <a href="{link}" style="background:#2D2B6B;color:white;padding:14px 28px;
              border-radius:6px;text-decoration:none;font-weight:bold;font-size:16px;">
@@ -482,31 +554,59 @@ def cerrar_semana(db: firestore.Client):
     except Exception as e:
         log.error(f"Error leyendo Sheets: {e}")
         return None
+
     docs = db.collection(FIRESTORE_COLECCION).stream()
     cits_dict = {d.id: d.to_dict() for d in docs}
+
+    # Resetear todas las prioridades
     for doc_id in cits_dict:
-        db.collection(FIRESTORE_COLECCION).document(doc_id).update({"prioridad": False})
+        db.collection(FIRESTORE_COLECCION).document(doc_id).update({
+            "prioridad": False,
+            "inicio_notificado": False,
+        })
+
+    # Marcar priorizadas usando fuente + comision + fecha
     priorizadas = 0
     for fila in filas:
         if not fila:
             continue
         val = fila[0].strip().upper() if fila else ""
-        if val not in ("SI", "SÍ", "YES", "S", "1"):
+        if val not in ("SI", "SI", "YES", "S", "1"):
             continue
-        inst     = fila[1].strip() if len(fila) > 1 else ""
-        comision = fila[2].strip() if len(fila) > 2 else ""
-        fuente   = "senado" if "Senado" in inst else "camara"
+        inst      = fila[1].strip() if len(fila) > 1 else ""
+        comision  = fila[2].strip() if len(fila) > 2 else ""
+        fecha_raw = fila[3].strip() if len(fila) > 3 else ""
+        fuente    = "senado" if "Senado" in inst else "camara"
+
+        # Convertir fecha del Sheets a YYYY-MM-DD
+        fecha_iso = ""
+        try:
+            partes    = fecha_raw.split(" ")
+            fecha_str = partes[-1] if len(partes) > 1 else fecha_raw
+            dt        = datetime.strptime(fecha_str, "%d/%m/%Y")
+            fecha_iso = dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
         for doc_id, c in cits_dict.items():
-            if c.get("fuente") == fuente and c.get("comision") == comision:
-                db.collection(FIRESTORE_COLECCION).document(doc_id).update({"prioridad": True})
+            if (c.get("fuente") == fuente and
+                c.get("comision") == comision and
+                (not fecha_iso or c.get("fecha") == fecha_iso)):
+                db.collection(FIRESTORE_COLECCION).document(doc_id).update({
+                    "prioridad": True,
+                    "inicio_notificado": False,
+                })
                 priorizadas += 1
                 break
+
     log.info(f"Prioridades actualizadas: {priorizadas} sesiones")
+
     docs_upd = db.collection(FIRESTORE_COLECCION).stream()
     cits     = [d.to_dict() for d in docs_upd]
     hoy      = datetime.now()
     fin      = hoy + timedelta(days=(4 - hoy.weekday() % 7))
     num_sem  = hoy.isocalendar()[1]
+
     ruta_pdf = generar_pdf(cits, num_sem, hoy.strftime("%d/%m"), fin.strftime("%d/%m/%Y"))
     if ruta_pdf:
         db.collection(FIRESTORE_CONFIG).document("pdf_semana").set({
@@ -587,7 +687,7 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
                        textColor=BADGE_C_TX, leading=9)
     e_sess_name    = E("sname", fontSize=10, fontName="Helvetica-Bold",
                        textColor=colors.HexColor("#1a1a2e"), leading=13)
-    e_sess_tema    = E("stema", fontSize=8.5, textColor=GRIS_TEXTO, leading=11)
+    e_sess_tema    = E("stema", fontSize=7.5, textColor=GRIS_TEXTO, leading=11)
     e_sess_time_s  = E("sts", fontSize=9, fontName="Helvetica-Bold",
                        textColor=KOM_MORADO, leading=11)
     e_sess_time_c  = E("stc", fontSize=9, fontName="Helvetica-Bold",
@@ -717,7 +817,7 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
 
                 info = [badge_tbl, Paragraph(comision, e_sess_name)]
                 if tema:
-                    info.append(Paragraph(tema[:2000], e_sess_tema))
+                    info.append(Paragraph(tema[:1000], e_sess_tema))
 
                 card_inner = Table(
                     [[Paragraph(horario, e_sess_time_s if es_s else e_sess_time_c), info]],
@@ -794,7 +894,6 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
             ])
 
         if filas:
-            # FIX: usar splitByRow=True para permitir division entre paginas
             COL1 = 0.6 * cm
             COL3 = 3.5 * cm
             COL2 = INNER_W - COL1 - COL3
@@ -812,7 +911,6 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
                 ("LINEBELOW",      (0, 0), (-1, -2), 0.5, GRIS_BORDE),
                 ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, GRIS_CLARO]),
             ]))
-            # Envolver con margen izquierdo usando padding de la tabla exterior
             elementos.append(Spacer(1, 0))
             elementos.append(resto_table)
 
@@ -859,7 +957,6 @@ def enviar_reporte_final(db: firestore.Client):
         f"❌ Suspendidas: {suspendid}"
     )
 
-    # Siempre regenerar el PDF para asegurar el nuevo diseño
     fin      = hoy + timedelta(days=(4 - hoy.weekday() % 7))
     ruta_pdf = generar_pdf(cits, num_sem, hoy.strftime("%d/%m"), fin.strftime("%d/%m/%Y"))
     if ruta_pdf:
@@ -888,6 +985,11 @@ def main(modo: str = "monitor"):
     if modo == "reporte":
         log.info("Enviando reporte final...")
         enviar_reporte_final(db)
+        return
+
+    if modo == "inicios":
+        log.info("Revisando inicios de sesiones...")
+        notificar_inicios(db)
         return
 
     log.info("Iniciando monitor de citaciones...")

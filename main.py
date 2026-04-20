@@ -3,20 +3,23 @@ import citaciones
 import os
 import requests
 from google.cloud import firestore
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
-TG_TOKEN = os.environ.get("TG_TOKEN", "8526676401:AAESmMiVjf7fKUi9bzcq0mMz2CJ0nzIIxxY")
+TG_TOKEN    = os.environ.get("TG_TOKEN", "8526676401:AAESmMiVjf7fKUi9bzcq0mMz2CJ0nzIIxxY")
 GCP_PROJECT = "crack-map-317501"
 
-def _tg_responder(chat_id: str, texto: str):
+
+def _tg(chat_id: str, texto: str):
     requests.post(
         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
         json={"chat_id": chat_id, "text": texto, "parse_mode": "HTML"},
         timeout=10
     )
 
-def _tg_responder_pdf(chat_id: str, ruta: str, caption: str = ""):
+
+def _tg_doc(chat_id: str, ruta: str, caption: str = ""):
     with open(ruta, "rb") as f:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
@@ -25,13 +28,14 @@ def _tg_responder_pdf(chat_id: str, ruta: str, caption: str = ""):
             timeout=30
         )
 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"ok": True})
 
-    msg = data.get("message", {})
+    msg     = data.get("message", {})
     chat_id = str(msg.get("chat", {}).get("id", ""))
     texto   = msg.get("text", "").strip()
     nombre  = msg.get("from", {}).get("first_name", "")
@@ -42,19 +46,19 @@ def webhook():
     db = firestore.Client(project=GCP_PROJECT)
 
     if texto == "/start":
-        # Registrar usuario
         db.collection("bot_usuarios").document(chat_id).set({
             "chat_id":  chat_id,
             "nombre":   nombre,
             "activo":   True,
-            "registro": citaciones.datetime.now(citaciones.timezone.utc),
+            "registro": datetime.now(timezone.utc),
         })
-        _tg_responder(chat_id,
+        _tg(chat_id,
             f"Bienvenido/a <b>{nombre}</b> al Calendario Legislativo KOM.\n\n"
-            f"Desde ahora recibirás:\n"
+            f"Desde ahora recibiras:\n"
             f"📅 Agenda semanal cada lunes\n"
+            f"🟢 Aviso de inicio de sesiones priorizadas\n"
             f"⚠️ Alertas de cambios en tiempo real\n\n"
-            f"Comandos disponibles:\n"
+            f"Comandos:\n"
             f"/reporte — PDF de la agenda actual\n"
             f"/agenda  — Resumen de la semana\n"
             f"/stop    — Dejar de recibir notificaciones"
@@ -62,7 +66,7 @@ def webhook():
 
     elif texto == "/stop":
         db.collection("bot_usuarios").document(chat_id).update({"activo": False})
-        _tg_responder(chat_id, "Has sido dado de baja. Escribe /start para volver a activarte.")
+        _tg(chat_id, "Has sido dado de baja. Escribe /start para volver a activarte.")
 
     elif texto == "/reporte":
         from datetime import datetime, timedelta
@@ -73,31 +77,31 @@ def webhook():
         ruta    = citaciones.generar_pdf(cits, num_sem,
                                          hoy.strftime("%d/%m"), fin.strftime("%d/%m/%Y"))
         if ruta:
-            total_s   = sum(1 for c in cits if c.get("fuente") == "senado" and not c.get("suspendida"))
-            total_c   = sum(1 for c in cits if c.get("fuente") == "camara" and not c.get("suspendida"))
-            priorit   = sum(1 for c in cits if c.get("prioridad"))
+            total_s = sum(1 for c in cits if c.get("fuente") == "senado" and not c.get("suspendida"))
+            total_c = sum(1 for c in cits if c.get("fuente") == "camara" and not c.get("suspendida"))
+            priorit = sum(1 for c in cits if c.get("prioridad"))
             caption = (
                 f"📅 <b>Agenda Legislativa — Semana {num_sem}</b>\n"
                 f"🏛 Senado: {total_s}  🏦 Camara: {total_c}  ⭐ Priorizadas: {priorit}"
             )
-            _tg_responder_pdf(chat_id, ruta, caption)
+            _tg_doc(chat_id, ruta, caption)
         else:
-            _tg_responder(chat_id, "Error generando el reporte.")
+            _tg(chat_id, "Error generando el reporte.")
 
     elif texto == "/agenda":
+        from datetime import datetime
         cits = [d.to_dict() for d in db.collection("citaciones").stream()
                 if not d.to_dict().get("suspendida")]
         if not cits:
-            _tg_responder(chat_id, "No hay citaciones disponibles.")
+            _tg(chat_id, "No hay citaciones disponibles.")
         else:
-            from datetime import datetime
             dias_es = {
                 "Monday":"Lunes","Tuesday":"Martes","Wednesday":"Miercoles",
                 "Thursday":"Jueves","Friday":"Viernes"
             }
             por_fecha = {}
             for c in cits:
-                f = c.get("fecha","")
+                f = c.get("fecha", "")
                 if f not in por_fecha:
                     por_fecha[f] = []
                 por_fecha[f].append(c)
@@ -110,18 +114,16 @@ def webhook():
                     lineas.append(f"\n<b>{dia} {dt.strftime('%d/%m')}</b>")
                 except Exception:
                     continue
-                for c in sorted(por_fecha[fecha], key=lambda x: x.get("horario","")):
+                for c in sorted(por_fecha[fecha], key=lambda x: x.get("horario", "")):
                     emoji = "🏛" if c.get("fuente") == "senado" else "🏦"
-                    lineas.append(f"  {emoji} {c.get('comision','')} — {c.get('horario','')}")
+                    prio  = "⭐ " if c.get("prioridad") else ""
+                    lineas.append(f"  {prio}{emoji} {c.get('comision','')} — {c.get('horario','')}")
 
             mensaje = "\n".join(lineas)
-            if len(mensaje) > 4000:
-                _tg_responder(chat_id, mensaje[:4000])
-            else:
-                _tg_responder(chat_id, mensaje)
+            _tg(chat_id, mensaje[:4000] if len(mensaje) > 4000 else mensaje)
 
     else:
-        _tg_responder(chat_id,
+        _tg(chat_id,
             "Comandos disponibles:\n"
             "/start   — Activar notificaciones\n"
             "/reporte — PDF agenda actual\n"
@@ -140,6 +142,16 @@ def monitor():
     except Exception as e:
         return jsonify({"status": "error", "detalle": str(e)}), 500
 
+
+@app.route("/inicios", methods=["POST", "GET"])
+def inicios():
+    try:
+        citaciones.main(modo="inicios")
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "detalle": str(e)}), 500
+
+
 @app.route("/sheets", methods=["POST", "GET"])
 def sheets():
     try:
@@ -147,6 +159,7 @@ def sheets():
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         return jsonify({"status": "error", "detalle": str(e)}), 500
+
 
 @app.route("/cerrar", methods=["POST", "GET"])
 def cerrar():
@@ -156,6 +169,7 @@ def cerrar():
     except Exception as e:
         return jsonify({"status": "error", "detalle": str(e)}), 500
 
+
 @app.route("/reporte", methods=["POST", "GET"])
 def reporte():
     try:
@@ -164,9 +178,11 @@ def reporte():
     except Exception as e:
         return jsonify({"status": "error", "detalle": str(e)}), 500
 
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
