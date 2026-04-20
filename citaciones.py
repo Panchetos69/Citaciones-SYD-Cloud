@@ -207,8 +207,8 @@ def extraer_tema(materia: str) -> str:
             continue
         if "Bol.N" in linea or "Bol. N" in linea:
             partes = linea.split(" ", 2)
-            return partes[2][:600] if len(partes) > 2 else linea[:600]
-        return linea[:600]
+            return partes[2][:1200] if len(partes) > 2 else linea[:1200]
+        return linea[:1200]
     return ""
 
 
@@ -229,7 +229,7 @@ def scrape_senado() -> list:
                     fecha      = parsear_fecha_senado(c.get("FECHA", "")),
                     horario    = c.get("HORARIO", "").strip(),
                     sala       = c.get("LUGAR", "").strip(),
-                    materia    = c.get("MATERIA", "").strip()[:600],
+                    materia    = c.get("MATERIA", "").strip()[:2000],
                     suspendida = bool(c.get("SIN_EFECTO", 0)),
                 ))
     except Exception as e:
@@ -269,7 +269,7 @@ def scrape_camara(semana: str = None) -> list:
                     fecha      = fecha,
                     horario    = celdas[1].get_text(strip=True) if len(celdas) > 1 else "",
                     sala       = celdas[2].get_text(strip=True) if len(celdas) > 2 else "",
-                    materia    = celdas[3].get_text(strip=True)[:600] if len(celdas) > 3 else "",
+                    materia    = celdas[3].get_text(strip=True)[:2000] if len(celdas) > 3 else "",
                     suspendida = suspendida,
                 ))
     except Exception as e:
@@ -301,13 +301,16 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
     datos = doc.to_dict()
     if nuevo_hash == datos.get("hash_contenido", ""):
         return "sin_cambios"
-    tipo = "suspendida" if (cit.suspendida and not datos.get("suspendida")) else "modificada"
-    ref.update({
-        "horario": cit.horario, "sala": cit.sala, "materia": cit.materia,
-        "suspendida": cit.suspendida, "hash_contenido": nuevo_hash,
-        "actualizada_en": datetime.now(timezone.utc),
-        "horario_anterior": datos.get("horario", ""),
-    })
+    horario_cambio   = cit.horario != datos.get("horario", "")
+    sala_cambio      = cit.sala != datos.get("sala", "")
+    suspendida_nueva = cit.suspendida and not datos.get("suspendida")
+
+    if suspendida_nueva:
+        tipo = "suspendida"       # sesion cancelada
+    elif horario_cambio or sala_cambio:
+        tipo = "modificada"       # adelanto, atraso o cambio de sala
+    else:
+        tipo = "sin_cambios"      # solo cambio de materia, no notificar
     return tipo
 
 
@@ -573,7 +576,7 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
                        textColor=BADGE_C_TX, leading=9)
     e_sess_name    = E("sname", fontSize=10, fontName="Helvetica-Bold",
                        textColor=colors.HexColor("#1a1a2e"), leading=13)
-    e_sess_tema    = E("stema", fontSize=8.5, textColor=GRIS_TEXTO, leading=12)
+    e_sess_tema    = E("stema", fontSize=8.5, textColor=GRIS_TEXTO, leading=11)
     e_sess_time_s  = E("sts", fontSize=9, fontName="Helvetica-Bold",
                        textColor=KOM_MORADO, leading=11)
     e_sess_time_c  = E("stc", fontSize=9, fontName="Helvetica-Bold",
@@ -703,7 +706,7 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
 
                 info = [badge_tbl, Paragraph(comision, e_sess_name)]
                 if tema:
-                    info.append(Paragraph(tema[:600], e_sess_tema))
+                    info.append(Paragraph(tema[:2000], e_sess_tema))
 
                 card_inner = Table(
                     [[Paragraph(horario, e_sess_time_s if es_s else e_sess_time_c), info]],
