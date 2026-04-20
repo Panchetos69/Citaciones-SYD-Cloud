@@ -103,35 +103,46 @@ def _sheets_svc():
 # ── Telegram ───────────────────────────────────────────────────────────────────
 def _tg_texto(msg: str):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10
-        )
-        if r.status_code != 200:
-            log.error(f"Telegram error: {r.text[:150]}")
-        else:
-            log.info("[Telegram] Texto enviado")
+        # Enviar a todos los usuarios activos
+        db = firestore.Client(project=GCP_PROJECT)
+        usuarios = db.collection("bot_usuarios").where("activo", "==", True).stream()
+        chat_ids = [d.to_dict().get("chat_id") for d in usuarios]
+        
+        # Si no hay usuarios registrados, enviar solo al chat_id por defecto
+        if not chat_ids:
+            chat_ids = [TG_CHAT_ID]
+
+        for chat_id in chat_ids:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=10
+            )
+        log.info(f"[Telegram] Mensaje enviado a {len(chat_ids)} usuarios")
     except Exception as e:
         log.error(f"Error Telegram: {e}")
 
 
 def _tg_pdf(ruta: str, caption: str = ""):
     try:
-        with open(ruta, "rb") as f:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-                data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
-                files={"document": f},
-                timeout=30
-            )
-        if r.status_code != 200:
-            log.error(f"Telegram PDF error: {r.text[:150]}")
-        else:
-            log.info("[Telegram] PDF enviado")
+        db = firestore.Client(project=GCP_PROJECT)
+        usuarios = db.collection("bot_usuarios").where("activo", "==", True).stream()
+        chat_ids = [d.to_dict().get("chat_id") for d in usuarios]
+        
+        if not chat_ids:
+            chat_ids = [TG_CHAT_ID]
+
+        for chat_id in chat_ids:
+            with open(ruta, "rb") as f:
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+                    data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                    files={"document": f},
+                    timeout=30
+                )
+        log.info(f"[Telegram] PDF enviado a {len(chat_ids)} usuarios")
     except Exception as e:
         log.error(f"Error Telegram PDF: {e}")
-
 
 # ── Email ──────────────────────────────────────────────────────────────────────
 def _enviar_email(destinatarios: list, asunto: str, cuerpo_html: str,
