@@ -29,7 +29,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # ── Configuracion ──────────────────────────────────────────────────────────────
-GCP_PROJECT         = "crack-map-317501"
+GCP_PROJECT         = "green-diagram-494113-u4"
 FIRESTORE_COLECCION = "citaciones"
 FIRESTORE_CONFIG    = "config"
 
