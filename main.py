@@ -1,14 +1,14 @@
 from flask import Flask, request, jsonify
+from datetime import datetime, timezone, timedelta
 import citaciones
 import os
 import requests
 from google.cloud import firestore
-from datetime import datetime, timezone
 
 app = Flask(__name__)
 
 TG_TOKEN    = os.environ.get("TG_TOKEN", "8526676401:AAESmMiVjf7fKUi9bzcq0mMz2CJ0nzIIxxY")
-GCP_PROJECT = "crack-map-317501"
+GCP_PROJECT = "green-diagram-494113-u4"
 
 
 def _tg(chat_id: str, texto: str):
@@ -69,7 +69,6 @@ def webhook():
         _tg(chat_id, "Has sido dado de baja. Escribe /start para volver a activarte.")
 
     elif texto == "/reporte":
-        from datetime import datetime, timedelta
         cits    = [d.to_dict() for d in db.collection("citaciones").stream()]
         hoy     = datetime.now()
         fin     = hoy + timedelta(days=(4 - hoy.weekday() % 7))
@@ -89,15 +88,14 @@ def webhook():
             _tg(chat_id, "Error generando el reporte.")
 
     elif texto == "/agenda":
-        from datetime import datetime
         cits = [d.to_dict() for d in db.collection("citaciones").stream()
                 if not d.to_dict().get("suspendida")]
         if not cits:
             _tg(chat_id, "No hay citaciones disponibles.")
         else:
             dias_es = {
-                "Monday":"Lunes","Tuesday":"Martes","Wednesday":"Miercoles",
-                "Thursday":"Jueves","Friday":"Viernes"
+                "Monday": "Lunes", "Tuesday": "Martes", "Wednesday": "Miercoles",
+                "Thursday": "Jueves", "Friday": "Viernes"
             }
             por_fecha = {}
             for c in cits:
