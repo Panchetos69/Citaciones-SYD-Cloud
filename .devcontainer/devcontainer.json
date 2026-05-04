@@ -1,1 +1,3 @@
-
+{
+  "postCreateCommand": "echo $GCP_CREDENTIALS > /workspaces/Citaciones-SYD-Cloud/credenciales.json && echo 'Credenciales configuradas'"
+}
