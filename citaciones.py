@@ -330,6 +330,12 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
     else:
         tipo = "sin_cambios"
 
+    # Solo notificar si la sesion es de hoy en adelante
+    from datetime import datetime
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    if tipo in ("suspendida", "modificada") and cit.fecha < hoy:
+        tipo = "sin_cambios"  # no notificar cambios de sesiones pasadas
+
     ref.update({
         "horario": cit.horario, "sala": cit.sala, "materia": cit.materia,
         "suspendida": cit.suspendida, "hash_contenido": nuevo_hash,
