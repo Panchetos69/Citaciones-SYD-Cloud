@@ -3,10 +3,10 @@ Monitor de Citaciones — Senado + Camara de Diputados
 =====================================================
 Modos:
   monitor  -> scraping cada 10 min, detecta cambios, notifica Telegram
-  inicios  -> revisa si hay sesiones priorizadas que empiecen en 5 min
-  sheets   -> llena Google Sheets semanal, envia email con link (domingo 20:00)
-  cerrar   -> lee prioridades del Sheets, genera PDF (lunes 01:00)
-  reporte  -> envia PDF por Telegram a todos (lunes 09:00)
+  sheets   -> llena Google Sheets semanal + email (domingo 20:00)
+  prueba   -> genera PDF de prueba y lo envia por Telegram (domingo 22:30)
+  cerrar   -> lee prioridades del Sheets, genera PDF final (lunes 01:00)
+  reporte  -> envia PDF final por Telegram (lunes 09:00)
 """
 
 import hashlib
@@ -42,31 +42,20 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", "fjossio@gmail.com")
 SMTP_PASS  = os.environ.get("SMTP_PASS",  "yzgnacsbxjchjknp")
 EMAILS_KOM = ["sergio@kom.cl", "francisco@kom.cl"]
 
-CREDS_PATH     = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credenciales.json")
-SHEETS_ID_FIJO = "18hQKwJzBseudqFrRAzO6dfu0q7JpsE6K_566R-R4p9A"
+CREDS_PATH      = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credenciales.json")
+SHEETS_ID_FIJO  = "18hQKwJzBseudqFrRAzO6dfu0q7JpsE6K_566R-R4p9A"
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "10c5912a5e8fddda31eeb47bfbba055e")
 
 SCOPES_SHEETS = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "max-age=0",
-    "Referer": "https://camara.cl/",
+HEADERS_SENADO = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
 }
 
 DIAS_ES = {
@@ -92,13 +81,30 @@ class Citacion:
     id:         str  = ""
 
     def __post_init__(self):
-        clave   = f"{self.fuente}_{self.comision}_{self.fecha}"
+        clave   = f"{self.fuente}_{self.comision}_{self.fecha}_{self.horario}"
         self.id = hashlib.sha256(clave.encode()).hexdigest()[:16]
 
     def hash_contenido(self) -> str:
         return hashlib.md5(
             f"{self.horario}_{self.sala}_{self.suspendida}".encode()
         ).hexdigest()
+
+
+# ── HTTP helpers ───────────────────────────────────────────────────────────────
+def get_html_senado(url: str) -> str:
+    r = requests.get(url, headers=HEADERS_SENADO, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+
+def get_html_camara(url: str) -> str:
+    r = requests.get(
+        "https://api.scraperapi.com/",
+        params={"api_key": SCRAPER_API_KEY, "url": url},
+        timeout=60
+    )
+    r.raise_for_status()
+    return r.text
 
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
@@ -152,33 +158,26 @@ def _tg_pdf(ruta: str, caption: str = ""):
 
 
 # ── Email ──────────────────────────────────────────────────────────────────────
-def _enviar_email(destinatarios: list, asunto: str, cuerpo_html: str,
-                  adjunto_path: str = None, adjunto_nombre: str = None):
+def _enviar_email(destinatarios: list, asunto: str, cuerpo_html: str):
     try:
         msg = MIMEMultipart("mixed")
         msg["Subject"] = asunto
         msg["From"]    = EMAIL_FROM
         msg["To"]      = ", ".join(destinatarios)
         msg.attach(MIMEText(cuerpo_html, "html", "utf-8"))
-        if adjunto_path and os.path.exists(adjunto_path):
-            with open(adjunto_path, "rb") as f:
-                parte = MIMEApplication(f.read(), _subtype="pdf")
-            parte.add_header("Content-Disposition", "attachment",
-                             filename=adjunto_nombre or os.path.basename(adjunto_path))
-            msg.attach(parte)
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
             s.starttls()
             s.login(EMAIL_FROM, SMTP_PASS)
             s.sendmail(EMAIL_FROM, destinatarios, msg.as_string())
         log.info(f"[Email] Enviado a {destinatarios}")
     except Exception as e:
-        log.error(f"Error enviando email: {e}")
+        log.error(f"Error email: {e}")
 
 
 # ── Helpers de fecha ───────────────────────────────────────────────────────────
 def parsear_fecha_senado(txt: str) -> str:
     m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", txt)
-    return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}" if m else txt
+    return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}" if m else ""
 
 
 def parsear_fecha_camara(txt: str) -> str:
@@ -190,27 +189,27 @@ def parsear_fecha_camara(txt: str) -> str:
     m = re.search(r"(\d{1,2})\s+DE\s+(\w+)\s+DE\s+(\d{4})", txt.upper())
     if m:
         return f"{m.group(3)}-{meses.get(m.group(2),'01')}-{m.group(1).zfill(2)}"
-    return txt
+    return ""
 
 
 def semana_actual() -> str:
     hoy = datetime.now()
     if hoy.weekday() >= 4:
-        prox_lunes = hoy + timedelta(days=(7 - hoy.weekday()))
+        ref = hoy + timedelta(days=(7 - hoy.weekday()))
     else:
-        prox_lunes = hoy - timedelta(days=hoy.weekday())
-    iso_year, iso_week, _ = prox_lunes.isocalendar()
+        ref = hoy - timedelta(days=hoy.weekday())
+    iso_year, iso_week, _ = ref.isocalendar()
     return f"{iso_year}-{iso_week:02d}"
 
 
 def semana_siguiente() -> str:
     hoy = datetime.now()
     if hoy.weekday() >= 4:
-        prox_lunes = hoy + timedelta(days=(7 - hoy.weekday()))
+        ref = hoy + timedelta(days=(7 - hoy.weekday()))
     else:
-        prox_lunes = hoy - timedelta(days=hoy.weekday())
-    sig_lunes = prox_lunes + timedelta(days=7)
-    iso_year, iso_week, _ = sig_lunes.isocalendar()
+        ref = hoy - timedelta(days=hoy.weekday())
+    sig = ref + timedelta(days=7)
+    iso_year, iso_week, _ = sig.isocalendar()
     return f"{iso_year}-{iso_week:02d}"
 
 
@@ -223,26 +222,29 @@ def extraer_tema(materia: str) -> str:
             continue
         if "Bol.N" in linea or "Bol. N" in linea:
             partes = linea.split(" ", 2)
-            return partes[2][:1200] if len(partes) > 2 else linea[:1200]
-        return linea[:1200]
+            return partes[2][:800] if len(partes) > 2 else linea[:800]
+        return linea[:800]
     return ""
 
 
-# ── Scrapers ───────────────────────────────────────────────────────────────────
+# ── Scraper Senado ─────────────────────────────────────────────────────────────
 def scrape_senado() -> list:
     citaciones = []
     try:
         r = requests.get(
             "https://web-back.senado.cl/api/commissions_citations?limit=100",
-            headers=HEADERS, timeout=20
+            headers=HEADERS_SENADO, timeout=20
         )
         r.raise_for_status()
         for dia in r.json().get("data", []):
             for c in dia.get("CITACIONES", []):
+                fecha = parsear_fecha_senado(c.get("FECHA", ""))
+                if not fecha:
+                    continue
                 citaciones.append(Citacion(
                     fuente     = "senado",
                     comision   = c.get("COMINOMBRE", "").strip(),
-                    fecha      = parsear_fecha_senado(c.get("FECHA", "")),
+                    fecha      = fecha,
                     horario    = c.get("HORARIO", "").strip(),
                     sala       = c.get("LUGAR", "").strip(),
                     materia    = c.get("MATERIA", "").strip()[:2000],
@@ -254,42 +256,81 @@ def scrape_senado() -> list:
     return citaciones
 
 
+# ── Scraper Camara ─────────────────────────────────────────────────────────────
 def scrape_camara(semana: str = None) -> list:
     if not semana:
         semana = semana_actual()
     citaciones = []
     try:
-        r = requests.get(
-            f"https://camara.cl/legislacion/comisiones/citaciones_semana.aspx?prmSemana={semana}",
-            headers=HEADERS, timeout=20
-        )
-        r.raise_for_status()
-        soup = BeautifulSoup(html_lib.unescape(r.text), "html.parser")
-        for article in soup.select("article.grid-12.citaciones"):
-            fecha_tag = article.select_one("p.fecha")
-            if not fecha_tag:
+        url  = f"https://camara.cl/legislacion/comisiones/citaciones_semana.aspx?prmSemana={semana}"
+        html = get_html_camara(url)
+        soup = BeautifulSoup(html_lib.unescape(html), "html.parser")
+
+        for article in soup.select("article.citaciones"):
+            # Obtener fecha del encabezado del dia
+            fecha = ""
+            txt_article = article.get_text()
+            m = re.search(r"(\d{1,2})\s+DE\s+(\w+)\s+DE\s+(\d{4})", txt_article.upper())
+            if m:
+                fecha = parsear_fecha_camara(m.group(0))
+            if not fecha:
                 continue
-            fecha = parsear_fecha_camara(fecha_tag.get_text(strip=True))
+
+            # Cada fila de la tabla es una comision
             for tr in article.select("table.tabla tbody tr"):
-                celdas = tr.select("td")
+                celdas = tr.find_all("td", recursive=False)
                 if len(celdas) < 3:
                     continue
-                raw        = celdas[0].get_text(strip=True)
-                suspendida = "suspendida" in raw.lower()
-                comision   = re.sub(r"(?i)suspendida", "", raw).strip()
-                if not comision or not fecha:
+
+                # td[0] = comision (con posible texto rojo si esta suspendida)
+                comision_raw = celdas[0].get_text(strip=True)
+                p_rojo = celdas[0].find("p", style=lambda s: s and "color:red" in s)
+                suspendida = bool(p_rojo and p_rojo.get_text(strip=True)) or \
+                             "suspendida" in comision_raw.lower()
+                comision = re.sub(r"(?i)suspendida", "", comision_raw).strip()
+                # Limpiar espacios extra del get_text
+                comision = comision.split("\n")[0].strip()
+
+                if not comision:
                     continue
+
+                horario = celdas[1].get_text(strip=True) if len(celdas) > 1 else ""
+                sala    = celdas[2].get_text(strip=True) if len(celdas) > 2 else ""
+
+                # td[3] tiene colspan=2 y contiene tabla anidada con citacion e invitados
+                materia = ""
+                if len(celdas) > 3:
+                    tabla_inner = celdas[3].find("table")
+                    if tabla_inner:
+                        citacion_partes = []
+                        invitados_partes = []
+                        for fila_inner in tabla_inner.find_all("tr"):
+                            tds_inner = fila_inner.find_all("td")
+                            if len(tds_inner) >= 1:
+                                txt_cit = tds_inner[0].get_text(separator=" ", strip=True)
+                                if txt_cit:
+                                    citacion_partes.append(txt_cit)
+                            if len(tds_inner) >= 2:
+                                txt_inv = tds_inner[1].get_text(separator=" ", strip=True)
+                                if txt_inv:
+                                    invitados_partes.append(txt_inv)
+                        materia = "\n".join(citacion_partes)
+                        if invitados_partes:
+                            materia += "\n\nInvitados:\n" + "\n".join(invitados_partes)
+
                 citaciones.append(Citacion(
                     fuente     = "camara",
                     comision   = comision,
                     fecha      = fecha,
-                    horario    = celdas[1].get_text(strip=True) if len(celdas) > 1 else "",
-                    sala       = celdas[2].get_text(strip=True) if len(celdas) > 2 else "",
-                    materia    = celdas[3].get_text(strip=True)[:2000] if len(celdas) > 3 else "",
+                    horario    = horario,
+                    sala       = sala,
+                    materia    = materia.strip()[:2000],
                     suspendida = suspendida,
                 ))
+
     except Exception as e:
-        log.error(f"Error Camara: {e}")
+        log.error(f"Error Camara ({semana}): {e}")
+
     vistos, unicos = set(), []
     for c in citaciones:
         if c.id not in vistos:
@@ -304,6 +345,7 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
     ref        = db.collection(FIRESTORE_COLECCION).document(cit.id)
     doc        = ref.get()
     nuevo_hash = cit.hash_contenido()
+
     if not doc.exists:
         ref.set({
             "fuente": cit.fuente, "comision": cit.comision,
@@ -311,16 +353,18 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
             "sala": cit.sala, "materia": cit.materia,
             "suspendida": cit.suspendida, "hash_contenido": nuevo_hash,
             "prioridad": False, "inicio_notificado": False,
+            "horario_anterior": cit.horario,
             "creada_en": datetime.now(timezone.utc),
             "actualizada_en": datetime.now(timezone.utc),
         })
         return "nueva"
+
     datos = doc.to_dict()
     if nuevo_hash == datos.get("hash_contenido", ""):
         return "sin_cambios"
 
     horario_cambio   = cit.horario != datos.get("horario", "")
-    sala_cambio      = cit.sala != datos.get("sala", "")
+    sala_cambio      = cit.sala    != datos.get("sala", "")
     suspendida_nueva = cit.suspendida and not datos.get("suspendida")
 
     if suspendida_nueva:
@@ -330,18 +374,16 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
     else:
         tipo = "sin_cambios"
 
-    # Solo notificar si la sesion es de hoy en adelante
-    from datetime import datetime
+    # No notificar cambios de sesiones que ya pasaron
     hoy = datetime.now().strftime("%Y-%m-%d")
     if tipo in ("suspendida", "modificada") and cit.fecha < hoy:
-        tipo = "sin_cambios"  # no notificar cambios de sesiones pasadas
+        tipo = "sin_cambios"
 
     ref.update({
         "horario": cit.horario, "sala": cit.sala, "materia": cit.materia,
         "suspendida": cit.suspendida, "hash_contenido": nuevo_hash,
         "actualizada_en": datetime.now(timezone.utc),
         "horario_anterior": datos.get("horario", ""),
-        # Si cambio el horario, resetear la notificacion de inicio
         "inicio_notificado": False if horario_cambio else datos.get("inicio_notificado", False),
     })
     return tipo
@@ -349,9 +391,13 @@ def guardar_citacion(db: firestore.Client, cit: Citacion) -> str:
 
 # ── Notificaciones ─────────────────────────────────────────────────────────────
 def notificar_nueva(cit: Citacion):
+    # Solo notificar nuevas de hoy en adelante
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    if cit.fecha < hoy:
+        return
     emoji = "🏛" if cit.fuente == "senado" else "🏦"
-    tema  = extraer_tema(cit.materia)
     inst  = "Senado" if cit.fuente == "senado" else "Camara"
+    tema  = extraer_tema(cit.materia)
     msg   = (
         f"🆕 <b>Nueva citacion — {inst}</b>\n{'─'*28}\n"
         f"{emoji} <b>{cit.comision}</b>\n"
@@ -386,17 +432,12 @@ def notificar_cambio(cit: Citacion, tipo: str, horario_anterior: str = ""):
     _tg_texto(msg)
 
 
-# ── Notificador de inicios ─────────────────────────────────────────────────────
 def notificar_inicios(db: firestore.Client):
-    """
-    Corre cada minuto. Avisa cuando una sesion priorizada
-    esta por empezar (en los proximos 5 min) o empieza ahora.
-    Si el horario cambio, resetea inicio_notificado para volver a avisar.
-    """
-    ahora    = datetime.now()
-    hoy      = ahora.strftime("%Y-%m-%d")
-    desde    = ahora.hour * 60 + ahora.minute
-    hasta    = desde + 6  # ventana de 6 minutos
+    """Corre cada 10 min junto al monitor."""
+    ahora = datetime.now()
+    hoy   = ahora.strftime("%Y-%m-%d")
+    desde = ahora.hour * 60 + ahora.minute
+    hasta = desde + 11
 
     try:
         docs = db.collection(FIRESTORE_COLECCION)\
@@ -404,44 +445,30 @@ def notificar_inicios(db: firestore.Client):
                  .where("prioridad", "==", True)\
                  .stream()
     except Exception as e:
-        log.error(f"Error consultando Firestore: {e}")
+        log.error(f"Error Firestore inicios: {e}")
         return
 
     for doc in docs:
         c = doc.to_dict()
-        if c.get("suspendida"):
+        if c.get("suspendida") or c.get("inicio_notificado"):
             continue
-        if c.get("inicio_notificado"):
-            continue
-
         horario = c.get("horario", "")
         try:
-            hora_inicio = horario.split(" ")[0]
-            h, m        = map(int, hora_inicio.split(":"))
-            minutos     = h * 60 + m
+            h, m    = map(int, horario.split(" ")[0].split(":"))
+            minutos = h * 60 + m
         except Exception:
             continue
 
         if desde <= minutos <= hasta:
-            emoji = "🏛" if c.get("fuente") == "senado" else "🏦"
-            inst  = "Senado" if c.get("fuente") == "senado" else "Camara"
-            tema  = extraer_tema(c.get("materia", ""))
-            mins_restantes = minutos - desde
-
-            if mins_restantes <= 1:
-                encabezado = f"🟢 <b>Sesion iniciando ahora — {inst}</b>"
-            else:
-                encabezado = f"⏰ <b>En {mins_restantes} min — {inst}</b>"
-
-            msg = (
-                f"{encabezado}\n{'─'*28}\n"
-                f"{emoji} <b>{c.get('comision','')}</b>\n"
-                f"🕐 {horario}\n"
-                f"📍 {c.get('sala','')[:60]}\n"
-            )
+            emoji     = "🏛" if c.get("fuente") == "senado" else "🏦"
+            inst      = "Senado" if c.get("fuente") == "senado" else "Camara"
+            mins_rest = minutos - desde
+            tema      = extraer_tema(c.get("materia", ""))
+            enc = f"🟢 <b>Sesion iniciando ahora — {inst}</b>" if mins_rest <= 1 \
+                  else f"⏰ <b>En {mins_rest} min — {inst}</b>"
+            msg = f"{enc}\n{'─'*28}\n{emoji} <b>{c.get('comision','')}</b>\n🕐 {horario}\n📍 {c.get('sala','')[:60]}\n"
             if tema:
                 msg += f"📌 {tema[:200]}"
-
             _tg_texto(msg)
             doc.reference.update({"inicio_notificado": True})
             log.info(f"[INICIO] {c.get('comision','')} — {horario}")
@@ -454,14 +481,11 @@ def llenar_sheets_semanal(db: firestore.Client):
     docs = db.collection(FIRESTORE_COLECCION).stream()
     cits = [d.to_dict() for d in docs if not d.to_dict().get("suspendida")]
     if not cits:
-        log.warning("No hay citaciones para llenar el Sheets")
+        log.warning("No hay citaciones")
         return
-    cits.sort(key=lambda x: (x.get("fecha", ""), x.get("horario", "")))
+    cits.sort(key=lambda x: (x.get("fecha",""), x.get("horario","")))
     svc = _sheets_svc()
-    svc.spreadsheets().values().clear(
-        spreadsheetId=SHEETS_ID_FIJO, range="A1:Z2000"
-    ).execute()
-    log.info("Sheets limpiado")
+    svc.spreadsheets().values().clear(spreadsheetId=SHEETS_ID_FIJO, range="A1:Z2000").execute()
     cabecera = [["PRIORIDAD (SI/NO)", "Institucion", "Comision", "Fecha", "Horario", "Sala", "Tema"]]
     filas = []
     for c in cits:
@@ -473,56 +497,35 @@ def llenar_sheets_semanal(db: firestore.Client):
             fecha = f"{dia} {dt.strftime('%d/%m/%Y')}"
         except Exception:
             pass
-        filas.append(["NO", inst, c.get("comision", ""), fecha,
-                      c.get("horario", ""), c.get("sala", "")[:60],
-                      c.get("materia", "")[:800]])
+        filas.append(["NO", inst, c.get("comision",""), fecha,
+                      c.get("horario",""), c.get("sala","")[:60], c.get("materia","")[:800]])
     svc.spreadsheets().values().update(
         spreadsheetId=SHEETS_ID_FIJO, range="A1",
         valueInputOption="RAW", body={"values": cabecera + filas}
     ).execute()
-    log.info(f"Sheets llenado con {len(filas)} citaciones")
-    n_filas = len(filas) + 1
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=SHEETS_ID_FIJO,
-        body={"requests": [
-            {"repeatCell": {
-                "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1},
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": {"red": 0.176, "green": 0.169, "blue": 0.42},
-                    "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                                   "bold": True, "fontSize": 11},
-                    "horizontalAlignment": "CENTER",
-                }},
-                "fields": "userEnteredFormat"
-            }},
-            {"repeatCell": {
-                "range": {"sheetId": 0, "startRowIndex": 1, "endRowIndex": n_filas,
-                          "startColumnIndex": 0, "endColumnIndex": 1},
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": {"red": 1, "green": 0.98, "blue": 0.8},
-                    "horizontalAlignment": "CENTER",
-                    "textFormat": {"bold": True},
-                }},
-                "fields": "userEnteredFormat"
-            }},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": 0, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
-                "properties": {"pixelSize": 150}, "fields": "pixelSize"
-            }},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": 0, "dimension": "COLUMNS", "startIndex": 2, "endIndex": 3},
-                "properties": {"pixelSize": 200}, "fields": "pixelSize"
-            }},
-            {"updateDimensionProperties": {
-                "range": {"sheetId": 0, "dimension": "COLUMNS", "startIndex": 6, "endIndex": 7},
-                "properties": {"pixelSize": 350}, "fields": "pixelSize"
-            }},
-            {"updateSheetProperties": {
-                "properties": {"sheetId": 0, "gridProperties": {"frozenRowCount": 1}},
-                "fields": "gridProperties.frozenRowCount"
-            }},
-        ]}
-    ).execute()
+    log.info(f"Sheets llenado: {len(filas)} citaciones")
+    n = len(filas) + 1
+    svc.spreadsheets().batchUpdate(spreadsheetId=SHEETS_ID_FIJO, body={"requests": [
+        {"repeatCell": {"range": {"sheetId":0,"startRowIndex":0,"endRowIndex":1},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red":0.176,"green":0.169,"blue":0.42},
+                "textFormat": {"foregroundColor":{"red":1,"green":1,"blue":1},"bold":True,"fontSize":11},
+                "horizontalAlignment": "CENTER"}},
+            "fields": "userEnteredFormat"}},
+        {"repeatCell": {"range": {"sheetId":0,"startRowIndex":1,"endRowIndex":n,"startColumnIndex":0,"endColumnIndex":1},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red":1,"green":0.98,"blue":0.8},
+                "horizontalAlignment": "CENTER","textFormat":{"bold":True}}},
+            "fields": "userEnteredFormat"}},
+        {"updateDimensionProperties": {"range":{"sheetId":0,"dimension":"COLUMNS","startIndex":0,"endIndex":1},
+            "properties":{"pixelSize":150},"fields":"pixelSize"}},
+        {"updateDimensionProperties": {"range":{"sheetId":0,"dimension":"COLUMNS","startIndex":2,"endIndex":3},
+            "properties":{"pixelSize":200},"fields":"pixelSize"}},
+        {"updateDimensionProperties": {"range":{"sheetId":0,"dimension":"COLUMNS","startIndex":6,"endIndex":7},
+            "properties":{"pixelSize":350},"fields":"pixelSize"}},
+        {"updateSheetProperties": {"properties":{"sheetId":0,"gridProperties":{"frozenRowCount":1}},
+            "fields":"gridProperties.frozenRowCount"}},
+    ]}).execute()
     link = f"https://docs.google.com/spreadsheets/d/{SHEETS_ID_FIJO}/edit"
     db.collection(FIRESTORE_CONFIG).document("sheets_semana").set({
         "sheets_id": SHEETS_ID_FIJO, "semana": num_semana,
@@ -536,18 +539,15 @@ def llenar_sheets_semanal(db: firestore.Client):
         <p style="color:#00F5A0;margin:5px 0 0 0;">{hoy.strftime('%d de %B de %Y')}</p>
       </div>
       <div style="background:#f9f9f9;padding:24px;border:1px solid #e0e0e0;">
-        <p>Hola equipo,</p>
-        <p>El sistema ha recopilado <b>{len(filas)} citaciones</b> para la semana.
-        Cambien <b>NO a SI</b> en la columna <b>PRIORIDAD</b> para marcar sesiones.</p>
+        <p>Hola equipo, se han recopilado <b>{len(filas)} citaciones</b> para la semana.</p>
+        <p>Cambien <b>NO a SI</b> en la columna PRIORIDAD para marcar sesiones.</p>
         <div style="text-align:center;margin:30px 0;">
           <a href="{link}" style="background:#2D2B6B;color:white;padding:14px 28px;
              border-radius:6px;text-decoration:none;font-weight:bold;font-size:16px;">
             Abrir Agenda en Google Sheets
           </a>
         </div>
-        <p style="color:#666;font-size:13px;">
-          <b>Plazo:</b> Cierre automatico el <b>lunes a la 01:00 AM</b>.
-        </p>
+        <p style="color:#666;font-size:13px;"><b>Plazo:</b> Cierre automatico el lunes a la 01:00 AM.</p>
         <hr style="border:none;border-top:1px solid #e0e0e0;margin:20px 0;">
         <p style="color:#999;font-size:11px;text-align:center;">KOM — Sistema de Monitoreo Legislativo</p>
       </div>
@@ -572,27 +572,23 @@ def cerrar_semana(db: firestore.Client):
     docs = db.collection(FIRESTORE_COLECCION).stream()
     cits_dict = {d.id: d.to_dict() for d in docs}
 
-    # Resetear todas las prioridades
     for doc_id in cits_dict:
         db.collection(FIRESTORE_COLECCION).document(doc_id).update({
-            "prioridad": False,
-            "inicio_notificado": False,
+            "prioridad": False, "inicio_notificado": False,
         })
 
-    # Marcar priorizadas usando fuente + comision + fecha
     priorizadas = 0
     for fila in filas:
         if not fila:
             continue
-        val = fila[0].strip().upper() if fila else ""
-        if val not in ("SI", "SI", "YES", "S", "1"):
+        val = fila[0].strip().upper()
+        if val not in ("SI", "SÍ", "YES", "S", "1"):
             continue
         inst      = fila[1].strip() if len(fila) > 1 else ""
         comision  = fila[2].strip() if len(fila) > 2 else ""
         fecha_raw = fila[3].strip() if len(fila) > 3 else ""
         fuente    = "senado" if "Senado" in inst else "camara"
 
-        # Convertir fecha del Sheets a YYYY-MM-DD
         fecha_iso = ""
         try:
             partes    = fecha_raw.split(" ")
@@ -603,24 +599,20 @@ def cerrar_semana(db: firestore.Client):
             pass
 
         for doc_id, c in cits_dict.items():
-            if (c.get("fuente") == fuente and
-                c.get("comision") == comision and
-                (not fecha_iso or c.get("fecha") == fecha_iso)):
+            if (c.get("fuente") == fuente and c.get("comision") == comision and
+                    (not fecha_iso or c.get("fecha") == fecha_iso)):
                 db.collection(FIRESTORE_COLECCION).document(doc_id).update({
-                    "prioridad": True,
-                    "inicio_notificado": False,
+                    "prioridad": True, "inicio_notificado": False,
                 })
                 priorizadas += 1
                 break
 
     log.info(f"Prioridades actualizadas: {priorizadas} sesiones")
-
     docs_upd = db.collection(FIRESTORE_COLECCION).stream()
     cits     = [d.to_dict() for d in docs_upd]
     hoy      = datetime.now()
     fin      = hoy + timedelta(days=(4 - hoy.weekday() % 7))
     num_sem  = hoy.isocalendar()[1]
-
     ruta_pdf = generar_pdf(cits, num_sem, hoy.strftime("%d/%m"), fin.strftime("%d/%m/%Y"))
     if ruta_pdf:
         db.collection(FIRESTORE_CONFIG).document("pdf_semana").set({
@@ -638,8 +630,7 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
         from reportlab.lib.units import cm
         from reportlab.lib import colors
         from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table,
-            TableStyle, HRFlowable, Image
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image
         )
         from reportlab.lib.enums import TA_CENTER, TA_RIGHT
     except ImportError:
@@ -669,349 +660,268 @@ def generar_pdf(cits: list, num_semana: int, fecha_inicio: str, fecha_fin: str) 
     W       = A4[0]
     INNER_W = W - 3 * cm
 
-    doc = SimpleDocTemplate(
-        ruta_pdf, pagesize=A4,
-        rightMargin=0, leftMargin=0,
-        topMargin=0, bottomMargin=1.5 * cm
-    )
-
+    doc = SimpleDocTemplate(ruta_pdf, pagesize=A4,
+                            rightMargin=0, leftMargin=0,
+                            topMargin=0, bottomMargin=1.5*cm)
     estilos = getSampleStyleSheet()
 
     def E(name, **kw):
         return ParagraphStyle(name, parent=estilos["Normal"], **kw)
 
-    e_header_title = E("ht", fontSize=16, fontName="Helvetica-Bold",
-                       textColor=colors.white, leading=20)
-    e_header_sub   = E("hs", fontSize=10, textColor=KOM_VERDE, leading=14)
-    e_stat_num     = E("sn", fontSize=20, fontName="Helvetica-Bold",
-                       textColor=KOM_MORADO, alignment=TA_CENTER, leading=24)
-    e_stat_num_g   = E("sg", fontSize=20, fontName="Helvetica-Bold",
-                       textColor=CAMARA_ACC, alignment=TA_CENTER, leading=24)
-    e_stat_num_r   = E("sr", fontSize=20, fontName="Helvetica-Bold",
-                       textColor=ROJO, alignment=TA_CENTER, leading=24)
-    e_stat_label   = E("sl", fontSize=8, textColor=GRIS_MUTED,
-                       alignment=TA_CENTER, leading=10)
-    e_section      = E("sec", fontSize=8, fontName="Helvetica-Bold",
-                       textColor=KOM_MORADO, leading=10)
-    e_day          = E("day", fontSize=9, fontName="Helvetica-Bold",
-                       textColor=GRIS_MUTED, leading=12)
-    e_badge_s      = E("bs", fontSize=7, fontName="Helvetica-Bold",
-                       textColor=BADGE_S_TX, leading=9)
-    e_badge_c      = E("bc", fontSize=7, fontName="Helvetica-Bold",
-                       textColor=BADGE_C_TX, leading=9)
-    e_sess_name    = E("sname", fontSize=10, fontName="Helvetica-Bold",
-                       textColor=colors.HexColor("#1a1a2e"), leading=13)
-    e_sess_tema    = E("stema", fontSize=7.5, textColor=GRIS_TEXTO, leading=11)
-    e_sess_time_s  = E("sts", fontSize=9, fontName="Helvetica-Bold",
-                       textColor=KOM_MORADO, leading=11)
-    e_sess_time_c  = E("stc", fontSize=9, fontName="Helvetica-Bold",
-                       textColor=CAMARA_ACC, leading=11)
-    e_resto_label  = E("rl", fontSize=8, fontName="Helvetica-Bold",
-                       textColor=GRIS_MUTED, leading=10)
-    e_resto_name   = E("rn", fontSize=9, textColor=colors.HexColor("#333333"), leading=11)
-    e_resto_hora   = E("rh", fontSize=8.5, textColor=GRIS_MUTED,
-                       alignment=TA_RIGHT, leading=11)
-    e_footer       = E("ft", fontSize=7.5, textColor=GRIS_MUTED, leading=10)
+    e_ht    = E("ht",    fontSize=16, fontName="Helvetica-Bold", textColor=colors.white, leading=20)
+    e_hs    = E("hs",    fontSize=10, textColor=KOM_VERDE, leading=14)
+    e_sn    = E("sn",    fontSize=20, fontName="Helvetica-Bold", textColor=KOM_MORADO, alignment=TA_CENTER, leading=24)
+    e_sg    = E("sg",    fontSize=20, fontName="Helvetica-Bold", textColor=CAMARA_ACC, alignment=TA_CENTER, leading=24)
+    e_sr    = E("sr",    fontSize=20, fontName="Helvetica-Bold", textColor=ROJO, alignment=TA_CENTER, leading=24)
+    e_sl    = E("sl",    fontSize=8,  textColor=GRIS_MUTED, alignment=TA_CENTER, leading=10)
+    e_sec   = E("sec",   fontSize=8,  fontName="Helvetica-Bold", textColor=KOM_MORADO, leading=10)
+    e_day   = E("day",   fontSize=9,  fontName="Helvetica-Bold", textColor=GRIS_MUTED, leading=12)
+    e_bs    = E("bs",    fontSize=7,  fontName="Helvetica-Bold", textColor=BADGE_S_TX, leading=9)
+    e_bc    = E("bc",    fontSize=7,  fontName="Helvetica-Bold", textColor=BADGE_C_TX, leading=9)
+    e_sname = E("sname", fontSize=10, fontName="Helvetica-Bold", textColor=colors.HexColor("#1a1a2e"), leading=13)
+    e_stema = E("stema", fontSize=7.5, textColor=GRIS_TEXTO, leading=11)
+    e_sts   = E("sts",   fontSize=9,  fontName="Helvetica-Bold", textColor=KOM_MORADO, leading=11)
+    e_stc   = E("stc",   fontSize=9,  fontName="Helvetica-Bold", textColor=CAMARA_ACC, leading=11)
+    e_rl    = E("rl",    fontSize=8,  fontName="Helvetica-Bold", textColor=GRIS_MUTED, leading=10)
+    e_rn    = E("rn",    fontSize=9,  textColor=colors.HexColor("#333333"), leading=11)
+    e_rh    = E("rh",    fontSize=8.5, textColor=GRIS_MUTED, alignment=TA_RIGHT, leading=11)
+    e_ft    = E("ft",    fontSize=7.5, textColor=GRIS_MUTED, leading=10)
 
     elementos = []
 
-    # ── CABECERA ───────────────────────────────────────────────────────────────
-    LOGO_BLANCO = "LOGO_KOM_BLANCO_Sin_fondo.png"
-    if os.path.exists(LOGO_BLANCO):
-        try:
-            logo_cell = Image(LOGO_BLANCO, width=3.2 * cm, height=1.4 * cm)
-        except Exception:
-            logo_cell = Paragraph("KOM", E("lt", fontSize=18, fontName="Helvetica-Bold",
-                                           textColor=colors.white))
-    else:
-        logo_cell = Paragraph("KOM", E("lt", fontSize=18, fontName="Helvetica-Bold",
-                                       textColor=colors.white))
+    # Cabecera
+    LOGO = "LOGO_KOM_BLANCO_Sin_fondo.png"
+    logo_cell = Image(LOGO, width=3.2*cm, height=1.4*cm) if os.path.exists(LOGO) else \
+                Paragraph("KOM", E("lt", fontSize=18, fontName="Helvetica-Bold", textColor=colors.white))
 
-    header_table = Table(
-        [[
-            [Paragraph("Agenda Legislativa", e_header_title),
-             Paragraph(f"Semana {num_semana}  ·  {fecha_inicio} al {fecha_fin}", e_header_sub)],
-            logo_cell
-        ]],
-        colWidths=[W - 4.5 * cm, 4.5 * cm]
-    )
-    header_table.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, -1), KOM_MORADO),
-        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING",   (0, 0), (0, 0),   24),
-        ("RIGHTPADDING",  (1, 0), (1, 0),   20),
-        ("TOPPADDING",    (0, 0), (-1, -1), 18),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
-        ("ALIGN",         (1, 0), (1, 0),   "RIGHT"),
+    cab = Table([[
+        [Paragraph("Agenda Legislativa", e_ht),
+         Paragraph(f"Semana {num_semana}  ·  {fecha_inicio} al {fecha_fin}", e_hs)],
+        logo_cell
+    ]], colWidths=[W-4.5*cm, 4.5*cm])
+    cab.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), KOM_MORADO),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ("LEFTPADDING",   (0,0),(0,0),   24),
+        ("RIGHTPADDING",  (1,0),(1,0),   20),
+        ("TOPPADDING",    (0,0),(-1,-1), 18),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 18),
+        ("ALIGN",         (1,0),(1,0),   "RIGHT"),
     ]))
-    elementos.append(header_table)
+    elementos.append(cab)
 
-    # ── METRICAS ───────────────────────────────────────────────────────────────
-    total_s   = sum(1 for c in cits if c.get("fuente") == "senado" and not c.get("suspendida"))
-    total_c   = sum(1 for c in cits if c.get("fuente") == "camara" and not c.get("suspendida"))
+    # Metricas
+    total_s   = sum(1 for c in cits if c.get("fuente")=="senado" and not c.get("suspendida"))
+    total_c   = sum(1 for c in cits if c.get("fuente")=="camara" and not c.get("suspendida"))
     priorit   = sum(1 for c in cits if c.get("prioridad"))
     suspendid = sum(1 for c in cits if c.get("suspendida"))
 
-    stats_table = Table(
-        [[
-            [Paragraph(str(total_s),   e_stat_num),   Paragraph("SENADO",      e_stat_label)],
-            [Paragraph(str(total_c),   e_stat_num),   Paragraph("CAMARA",      e_stat_label)],
-            [Paragraph(str(priorit),   e_stat_num_g), Paragraph("PRIORIZADAS", e_stat_label)],
-            [Paragraph(str(suspendid), e_stat_num_r), Paragraph("SUSPENDIDAS", e_stat_label)],
-        ]],
-        colWidths=[W / 4] * 4
-    )
-    stats_table.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, -1), colors.white),
-        ("TOPPADDING",    (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-        ("LINEAFTER",     (0, 0), (2, 0),   0.5, GRIS_BORDE),
-        ("LINEBELOW",     (0, 0), (-1, -1), 0.5, GRIS_BORDE),
+    stats = Table([[
+        [Paragraph(str(total_s),   e_sn), Paragraph("SENADO",      e_sl)],
+        [Paragraph(str(total_c),   e_sn), Paragraph("CAMARA",      e_sl)],
+        [Paragraph(str(priorit),   e_sg), Paragraph("PRIORIZADAS", e_sl)],
+        [Paragraph(str(suspendid), e_sr), Paragraph("SUSPENDIDAS", e_sl)],
+    ]], colWidths=[W/4]*4)
+    stats.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), colors.white),
+        ("TOPPADDING",    (0,0),(-1,-1), 10),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 10),
+        ("LINEAFTER",     (0,0),(2,0),   0.5, GRIS_BORDE),
+        ("LINEBELOW",     (0,0),(-1,-1), 0.5, GRIS_BORDE),
     ]))
-    elementos.append(stats_table)
+    elementos.append(stats)
     elementos.append(Spacer(1, 14))
 
-    # ── SESIONES PRIORIZADAS ───────────────────────────────────────────────────
+    # Sesiones priorizadas
     priorizadas = [c for c in cits if c.get("prioridad") and not c.get("suspendida")]
-
     if priorizadas:
-        elementos.append(Table(
-            [[Paragraph("SESIONES PRIORIZADAS", e_section)]],
+        elementos.append(Table([[Paragraph("SESIONES PRIORIZADAS", e_sec)]],
             colWidths=[INNER_W],
-            style=[("LEFTPADDING", (0, 0), (-1, -1), 1.5 * cm),
-                   ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]
-        ))
-        elementos.append(Table(
-            [[HRFlowable(width=INNER_W, thickness=0.5, color=KOM_MORADO)]],
+            style=[("LEFTPADDING",(0,0),(-1,-1),1.5*cm),("BOTTOMPADDING",(0,0),(-1,-1),2)]))
+        elementos.append(Table([[HRFlowable(width=INNER_W, thickness=0.5, color=KOM_MORADO)]],
             colWidths=[INNER_W],
-            style=[("LEFTPADDING", (0, 0), (-1, -1), 1.5 * cm),
-                   ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]
-        ))
+            style=[("LEFTPADDING",(0,0),(-1,-1),1.5*cm),("BOTTOMPADDING",(0,0),(-1,-1),8)]))
 
         por_fecha = {}
         for c in priorizadas:
-            f = c.get("fecha", "")
-            if f not in por_fecha:
-                por_fecha[f] = []
+            f = c.get("fecha","")
+            if f not in por_fecha: por_fecha[f] = []
             por_fecha[f].append(c)
 
         for fecha in sorted(por_fecha.keys()):
             try:
                 dt    = datetime.strptime(fecha, "%Y-%m-%d")
-                label = f"{DIAS_ES.get(dt.strftime('%A'), '')} {dt.day} de {MESES[dt.month]}".upper()
+                label = f"{DIAS_ES.get(dt.strftime('%A'),'')} {dt.day} de {MESES[dt.month]}".upper()
             except Exception:
                 label = fecha
 
-            elementos.append(Table(
-                [[Paragraph(label, e_day)]],
+            elementos.append(Table([[Paragraph(label, e_day)]],
                 colWidths=[INNER_W],
-                style=[("LEFTPADDING", (0, 0), (-1, -1), 1.5 * cm),
-                       ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]
-            ))
+                style=[("LEFTPADDING",(0,0),(-1,-1),1.5*cm),("BOTTOMPADDING",(0,0),(-1,-1),4)]))
 
-            for c in sorted(por_fecha[fecha], key=lambda x: x.get("horario", "")):
-                fuente   = c.get("fuente", "senado")
-                comision = c.get("comision", "").strip()
-                horario  = c.get("horario", "")
-                tema     = extraer_tema(c.get("materia", ""))
+            for c in sorted(por_fecha[fecha], key=lambda x: x.get("horario","")):
+                fuente   = c.get("fuente","senado")
                 es_s     = fuente == "senado"
+                comision = c.get("comision","").strip()
+                horario  = c.get("horario","")
+                tema     = extraer_tema(c.get("materia",""))
 
-                badge_tbl = Table(
-                    [[Paragraph("SENADO" if es_s else "CAMARA",
-                                e_badge_s if es_s else e_badge_c)]],
-                    colWidths=[1.5 * cm],
-                    style=[
-                        ("BACKGROUND",    (0, 0), (-1, -1), BADGE_S_BG if es_s else BADGE_C_BG),
-                        ("TOPPADDING",    (0, 0), (-1, -1), 1),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-                        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
-                        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
-                    ]
-                )
+                badge = Table([[Paragraph("SENADO" if es_s else "CAMARA", e_bs if es_s else e_bc)]],
+                    colWidths=[1.5*cm],
+                    style=[("BACKGROUND",(0,0),(-1,-1),BADGE_S_BG if es_s else BADGE_C_BG),
+                           ("TOPPADDING",(0,0),(-1,-1),1),("BOTTOMPADDING",(0,0),(-1,-1),1),
+                           ("LEFTPADDING",(0,0),(-1,-1),4),("RIGHTPADDING",(0,0),(-1,-1),4)])
 
-                info = [badge_tbl, Paragraph(comision, e_sess_name)]
-                if tema:
-                    info.append(Paragraph(tema[:1000], e_sess_tema))
+                info = [badge, Paragraph(comision, e_sname)]
+                if tema: info.append(Paragraph(tema[:800], e_stema))
 
-                card_inner = Table(
-                    [[Paragraph(horario, e_sess_time_s if es_s else e_sess_time_c), info]],
-                    colWidths=[2.2 * cm, INNER_W - 2.8 * cm]
-                )
-                card_inner.setStyle(TableStyle([
-                    ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING",   (0, 0), (0, 0),   10),
-                    ("RIGHTPADDING",  (1, 0), (1, 0),   10),
-                    ("TOPPADDING",    (0, 0), (-1, -1), 8),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                    ("BACKGROUND",    (0, 0), (-1, -1), SENADO_BG if es_s else CAMARA_BG),
-                    ("LINEBEFORE",    (0, 0), (0, -1),  3, SENADO_ACC if es_s else CAMARA_ACC),
+                card = Table([[Paragraph(horario, e_sts if es_s else e_stc), info]],
+                    colWidths=[2.2*cm, INNER_W-2.8*cm])
+                card.setStyle(TableStyle([
+                    ("VALIGN",(0,0),(-1,-1),"TOP"),
+                    ("LEFTPADDING",(0,0),(0,0),10),("RIGHTPADDING",(1,0),(1,0),10),
+                    ("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8),
+                    ("BACKGROUND",(0,0),(-1,-1),SENADO_BG if es_s else CAMARA_BG),
+                    ("LINEBEFORE",(0,0),(0,-1),3,SENADO_ACC if es_s else CAMARA_ACC),
                 ]))
-
-                elementos.append(Table(
-                    [[card_inner]],
-                    colWidths=[INNER_W],
-                    style=[
-                        ("LEFTPADDING",   (0, 0), (-1, -1), 1.5 * cm),
-                        ("RIGHTPADDING",  (0, 0), (-1, -1), 1.5 * cm),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                        ("TOPPADDING",    (0, 0), (-1, -1), 0),
-                    ]
-                ))
+                elementos.append(Table([[card]], colWidths=[INNER_W],
+                    style=[("LEFTPADDING",(0,0),(-1,-1),1.5*cm),
+                           ("RIGHTPADDING",(0,0),(-1,-1),1.5*cm),
+                           ("BOTTOMPADDING",(0,0),(-1,-1),5),
+                           ("TOPPADDING",(0,0),(-1,-1),0)]))
 
         elementos.append(Spacer(1, 14))
 
-    # ── RESTO DE LA AGENDA ─────────────────────────────────────────────────────
+    # Resto de la agenda
     resto = [c for c in cits if not c.get("prioridad") and not c.get("suspendida")]
-
     if resto:
-        elementos.append(Table(
-            [[Paragraph(f"RESTO DE LA AGENDA  ({len(resto)} sesiones)", e_resto_label)]],
+        elementos.append(Table([[Paragraph(f"RESTO DE LA AGENDA  ({len(resto)} sesiones)", e_rl)]],
             colWidths=[INNER_W],
-            style=[("LEFTPADDING",   (0, 0), (-1, -1), 1.5 * cm),
-                   ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]
-        ))
+            style=[("LEFTPADDING",(0,0),(-1,-1),1.5*cm),("BOTTOMPADDING",(0,0),(-1,-1),6)]))
 
-        filas = []
-        for c in sorted(resto, key=lambda x: (x.get("fecha", ""), x.get("horario", ""))):
-            fuente   = c.get("fuente", "")
-            comision = c.get("comision", "").strip()
-            horario  = c.get("horario", "")
-            fecha    = c.get("fecha", "")
+        filas_r = []
+        for c in sorted(resto, key=lambda x: (x.get("fecha",""), x.get("horario",""))):
+            fuente = c.get("fuente","")
+            fecha  = c.get("fecha","")
             try:
                 dt        = datetime.strptime(fecha, "%Y-%m-%d")
-                dia       = DIAS_ES.get(dt.strftime("%A"), "")[:3]
-                fecha_fmt = f"{dia} {dt.strftime('%d/%m')}"
+                fecha_fmt = f"{DIAS_ES.get(dt.strftime('%A'),'')[:3]} {dt.strftime('%d/%m')}"
             except Exception:
                 fecha_fmt = fecha
 
-            inst_lbl = "S" if fuente == "senado" else "C"
-            inst_bg  = BADGE_S_BG if fuente == "senado" else BADGE_C_BG
-            inst_tx  = BADGE_S_TX if fuente == "senado" else BADGE_C_TX
+            inst_lbl = "S" if fuente=="senado" else "C"
+            inst_bg  = BADGE_S_BG if fuente=="senado" else BADGE_C_BG
+            inst_tx  = BADGE_S_TX if fuente=="senado" else BADGE_C_TX
 
-            badge_r = Table(
-                [[Paragraph(inst_lbl, ParagraphStyle("rb", parent=estilos["Normal"],
-                             fontSize=7, fontName="Helvetica-Bold",
-                             textColor=inst_tx, alignment=TA_CENTER))]],
-                colWidths=[0.4 * cm],
-                style=[
-                    ("BACKGROUND",    (0, 0), (-1, -1), inst_bg),
-                    ("TOPPADDING",    (0, 0), (-1, -1), 1),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-                    ("LEFTPADDING",   (0, 0), (-1, -1), 2),
-                    ("RIGHTPADDING",  (0, 0), (-1, -1), 2),
-                ]
-            )
-            filas.append([
-                badge_r,
-                Paragraph(comision, e_resto_name),
-                Paragraph(f"{fecha_fmt}  {horario}", e_resto_hora),
-            ])
+            badge_r = Table([[Paragraph(inst_lbl, ParagraphStyle("rb", parent=estilos["Normal"],
+                             fontSize=7, fontName="Helvetica-Bold", textColor=inst_tx, alignment=TA_CENTER))]],
+                colWidths=[0.4*cm],
+                style=[("BACKGROUND",(0,0),(-1,-1),inst_bg),
+                       ("TOPPADDING",(0,0),(-1,-1),1),("BOTTOMPADDING",(0,0),(-1,-1),1),
+                       ("LEFTPADDING",(0,0),(-1,-1),2),("RIGHTPADDING",(0,0),(-1,-1),2)])
+            filas_r.append([badge_r, Paragraph(c.get("comision","").strip(), e_rn),
+                            Paragraph(f"{fecha_fmt}  {c.get('horario','')}", e_rh)])
 
-        if filas:
-            COL1 = 0.6 * cm
-            COL3 = 3.5 * cm
-            COL2 = INNER_W - COL1 - COL3
-            resto_table = Table(
-                filas,
-                colWidths=[COL1, COL2, COL3],
-                splitByRow=True,
-            )
-            resto_table.setStyle(TableStyle([
-                ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING",    (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
-                ("TOPPADDING",     (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
-                ("LINEBELOW",      (0, 0), (-1, -2), 0.5, GRIS_BORDE),
-                ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, GRIS_CLARO]),
+        if filas_r:
+            COL1 = 0.6*cm; COL3 = 3.5*cm; COL2 = INNER_W - COL1 - COL3
+            t = Table(filas_r, colWidths=[COL1, COL2, COL3], splitByRow=True)
+            t.setStyle(TableStyle([
+                ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+                ("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),
+                ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4),
+                ("LINEBELOW",(0,0),(-1,-2),0.5,GRIS_BORDE),
+                ("ROWBACKGROUNDS",(0,0),(-1,-1),[colors.white, GRIS_CLARO]),
             ]))
-            elementos.append(Spacer(1, 0))
-            elementos.append(resto_table)
+            elementos.append(t)
 
-    # ── PIE ────────────────────────────────────────────────────────────────────
+    # Pie
     elementos.append(Spacer(1, 16))
-    pie = Table(
-        [[
-            Paragraph("Generado automaticamente · KOM Sistema Legislativo", e_footer),
-            Paragraph(f"{datetime.now().strftime('%d/%m/%Y')}  ·  senado.cl / camara.cl", e_footer)
-        ]],
-        colWidths=[INNER_W / 2, INNER_W / 2]
-    )
+    pie = Table([[
+        Paragraph("Generado automaticamente · KOM Sistema Legislativo", e_ft),
+        Paragraph(f"{datetime.now().strftime('%d/%m/%Y')}  ·  senado.cl / camara.cl", e_ft)
+    ]], colWidths=[INNER_W/2, INNER_W/2])
     pie.setStyle(TableStyle([
-        ("ALIGN",        (1, 0), (1, 0),   "RIGHT"),
-        ("LINEABOVE",    (0, 0), (-1, -1), 0.5, GRIS_BORDE),
-        ("TOPPADDING",   (0, 0), (-1, -1), 8),
-        ("LEFTPADDING",  (0, 0), (0, 0),   1.5 * cm),
-        ("RIGHTPADDING", (1, 0), (1, 0),   1.5 * cm),
+        ("ALIGN",(1,0),(1,0),"RIGHT"),
+        ("LINEABOVE",(0,0),(-1,-1),0.5,GRIS_BORDE),
+        ("TOPPADDING",(0,0),(-1,-1),8),
+        ("LEFTPADDING",(0,0),(0,0),1.5*cm),
+        ("RIGHTPADDING",(1,0),(1,0),1.5*cm),
     ]))
     elementos.append(pie)
 
     doc.build(elementos)
-    log.info(f"PDF ejecutivo generado: {ruta_pdf}")
+    log.info(f"PDF generado: {ruta_pdf}")
     return ruta_pdf
 
 
 # ── Reporte final ──────────────────────────────────────────────────────────────
-def enviar_reporte_final(db: firestore.Client):
-    doc = db.collection(FIRESTORE_CONFIG).document("pdf_semana").get()
-    hoy = datetime.now()
+def enviar_reporte_final(db: firestore.Client, es_prueba: bool = False):
+    hoy       = datetime.now()
     cits      = [d.to_dict() for d in db.collection(FIRESTORE_COLECCION).stream()]
-    total_s   = sum(1 for c in cits if c.get("fuente") == "senado" and not c.get("suspendida"))
-    total_c   = sum(1 for c in cits if c.get("fuente") == "camara" and not c.get("suspendida"))
+    total_s   = sum(1 for c in cits if c.get("fuente")=="senado" and not c.get("suspendida"))
+    total_c   = sum(1 for c in cits if c.get("fuente")=="camara" and not c.get("suspendida"))
     priorit   = sum(1 for c in cits if c.get("prioridad"))
     suspendid = sum(1 for c in cits if c.get("suspendida"))
-    num_sem   = doc.to_dict().get("semana", hoy.isocalendar()[1]) if doc.exists else hoy.isocalendar()[1]
+    num_sem   = hoy.isocalendar()[1]
+    fin       = hoy + timedelta(days=(4 - hoy.weekday() % 7))
+    ruta_pdf  = generar_pdf(cits, num_sem, hoy.strftime("%d/%m"), fin.strftime("%d/%m/%Y"))
 
+    prefijo = "🔍 <b>PRUEBA</b> — " if es_prueba else ""
     caption = (
-        f"📅 <b>Agenda Legislativa — Semana {num_sem}</b>\n"
+        f"{prefijo}📅 <b>Agenda Legislativa — Semana {num_sem}</b>\n"
         f"<i>{hoy.strftime('%d/%m/%Y')}</i>\n\n"
         f"🏛 Senado: {total_s} sesiones\n"
         f"🏦 Camara: {total_c} sesiones\n"
         f"⭐ Priorizadas: {priorit}\n"
         f"❌ Suspendidas: {suspendid}"
     )
+    if es_prueba:
+        caption += "\n\n<i>Reporte de prueba. El definitivo se envia el lunes 09:00.</i>"
 
-    fin      = hoy + timedelta(days=(4 - hoy.weekday() % 7))
-    ruta_pdf = generar_pdf(cits, num_sem, hoy.strftime("%d/%m"), fin.strftime("%d/%m/%Y"))
     if ruta_pdf:
         _tg_pdf(ruta_pdf, caption)
-        try:
-            os.remove(ruta_pdf)
-        except Exception:
-            pass
-    log.info("Reporte final enviado")
+        if not es_prueba:
+            db.collection(FIRESTORE_CONFIG).document("pdf_semana").set({
+                "ruta_local": ruta_pdf, "semana": num_sem,
+                "creado_en": datetime.now(timezone.utc),
+            })
+        try: os.remove(ruta_pdf)
+        except: pass
+
+    log.info(f"Reporte {'prueba' if es_prueba else 'final'} enviado")
 
 
-# ── Flujo principal ────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main(modo: str = "monitor"):
     db = firestore.Client(project=GCP_PROJECT)
 
     if modo == "sheets":
-        log.info("Llenando Google Sheets semanal...")
+        log.info("Llenando Sheets...")
         llenar_sheets_semanal(db)
         return
 
+    if modo == "prueba":
+        log.info("Enviando reporte de prueba...")
+        enviar_reporte_final(db, es_prueba=True)
+        return
+
     if modo == "cerrar":
-        log.info("Cerrando semana y generando PDF...")
+        log.info("Cerrando semana...")
         cerrar_semana(db)
         return
 
     if modo == "reporte":
         log.info("Enviando reporte final...")
-        enviar_reporte_final(db)
+        enviar_reporte_final(db, es_prueba=False)
         return
 
-    if modo == "inicios":
-        log.info("Revisando inicios de sesiones...")
-        notificar_inicios(db)
-        return
-
-    log.info("Iniciando monitor de citaciones...")
+    # monitor (default)
+    log.info("Iniciando monitor...")
     todas = scrape_senado()
     for sem in [semana_actual(), semana_siguiente()]:
         todas += scrape_camara(semana=sem)
 
-    log.info(f"Total: {len(todas)} citaciones")
+    log.info(f"Total scraped: {len(todas)}")
     nuevas = modificadas = suspendidas = 0
 
     for cit in todas:
@@ -1023,12 +933,15 @@ def main(modo: str = "monitor"):
             elif res == "modificada":
                 modificadas += 1
                 d = db.collection(FIRESTORE_COLECCION).document(cit.id).get().to_dict()
-                notificar_cambio(cit, "modificada", d.get("horario_anterior", ""))
+                notificar_cambio(cit, "modificada", d.get("horario_anterior",""))
             elif res == "suspendida":
                 suspendidas += 1
                 notificar_cambio(cit, "suspendida")
         except Exception as e:
             log.error(f"Error {cit.comision}: {e}")
+
+    # Verificar inicios junto al monitor
+    notificar_inicios(db)
 
     log.info(f"Resumen: {nuevas} nuevas | {modificadas} mod | {suspendidas} susp")
 
