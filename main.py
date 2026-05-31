@@ -150,6 +150,15 @@ def inicios():
         return jsonify({"status": "error", "detalle": str(e)}), 500
 
 
+@app.route("/prueba", methods=["POST", "GET"])
+def prueba():
+    try:
+        citaciones.main(modo="prueba")
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "detalle": str(e)}), 500
+
+
 @app.route("/sheets", methods=["POST", "GET"])
 def sheets():
     try:
