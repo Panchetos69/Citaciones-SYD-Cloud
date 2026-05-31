@@ -112,9 +112,14 @@ def get_html_camara(url):
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
 def _sheets_svc():
-    creds = service_account.Credentials.from_service_account_file(
-        CREDS_PATH, scopes=SCOPES_SHEETS
-    )
+    import os
+    if os.path.exists(CREDS_PATH):
+        creds = service_account.Credentials.from_service_account_file(
+            CREDS_PATH, scopes=SCOPES_SHEETS
+        )
+    else:
+        import google.auth
+        creds, _ = google.auth.default(scopes=SCOPES_SHEETS)
     return build("sheets", "v4", credentials=creds)
 
 
