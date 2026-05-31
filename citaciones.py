@@ -335,7 +335,8 @@ def guardar_citacion(db, cit):
     ref        = db.collection(FIRESTORE_COLECCION).document(cit.id)
     doc        = ref.get()
     nuevo_hash = cit.hash_contenido()
-    hoy        = datetime.now().strftime("%Y-%m-%d")
+    from zoneinfo import ZoneInfo
+    hoy        = datetime.now(ZoneInfo("America/Santiago")).strftime("%Y-%m-%d")
 
     if not doc.exists:
         ref.set({
@@ -383,7 +384,8 @@ def guardar_citacion(db, cit):
 # ── Notificaciones ─────────────────────────────────────────────────────────────
 def notificar_nueva(cit, en_resumen=False):
     """Solo notifica citaciones nuevas que NO estaban en el resumen semanal."""
-    hoy = datetime.now().strftime("%Y-%m-%d")
+    from zoneinfo import ZoneInfo
+    hoy = datetime.now(ZoneInfo("America/Santiago")).strftime("%Y-%m-%d")
     if cit.fecha < hoy:
         return
     if en_resumen:
@@ -426,7 +428,8 @@ def notificar_cambio(cit, tipo, horario_anterior=""):
 
 
 def notificar_inicios(db):
-    ahora = datetime.now()
+    from zoneinfo import ZoneInfo
+    ahora = datetime.now(ZoneInfo("America/Santiago"))
     hoy   = ahora.strftime("%Y-%m-%d")
     desde = ahora.hour * 60 + ahora.minute
     hasta = desde + 11
