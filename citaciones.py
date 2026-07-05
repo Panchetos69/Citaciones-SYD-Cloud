@@ -49,7 +49,7 @@ SMTP_HOST  = "smtp.gmail.com"
 SMTP_PORT  = 587
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "fjossio@gmail.com")
 SMTP_PASS  = os.environ.get("SMTP_PASS",  "yzgnacsbxjchjknp")
-EMAILS_KOM = ["sergio@kom.cl", "francisco@kom.cl"]
+EMAILS_KOM = ["sergio@kom.cl", "francisco@kom.cl", "david@kom.cl", "catalina@kom.cl"]
 
 CREDS_PATH      = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credenciales.json")
 SHEETS_ID_FIJO  = "18hQKwJzBseudqFrRAzO6dfu0q7JpsE6K_566R-R4p9A"
