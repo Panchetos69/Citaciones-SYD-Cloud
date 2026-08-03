@@ -216,15 +216,18 @@ def semana_siguiente():
 
 
 def extraer_tema(materia):
+    """Retorna el texto completo de la materia limpiando solo lineas de invitados."""
+    lineas = []
     for linea in materia.split("\n"):
         linea = linea.strip()
-        if not linea or linea.startswith("A este") or linea.startswith("A esta"):
+        if not linea:
             continue
-        if "Bol.N" in linea or "Bol. N" in linea:
-            partes = linea.split(" ", 2)
-            return partes[2][:800] if len(partes) > 2 else linea[:800]
-        return linea[:800]
-    return ""
+        if linea.startswith("A este") or linea.startswith("A esta"):
+            continue
+        if linea.startswith("Invitados:"):
+            break
+        lineas.append(linea)
+    return "\n".join(lineas)[:2000]
 
 
 # ── Scraper Senado ─────────────────────────────────────────────────────────────
@@ -387,6 +390,33 @@ def guardar_citacion(db, cit):
 
 
 # ── Notificaciones ─────────────────────────────────────────────────────────────
+def _url_citacion(cit):
+    if cit.fuente == "senado":
+        return "https://www.senado.cl/actividad/comisiones/citaciones"
+    try:
+        dt = datetime.strptime(cit.fecha, "%Y-%m-%d")
+        y, w, _ = dt.isocalendar()
+        return f"https://camara.cl/legislacion/comisiones/citaciones_semana.aspx?prmSemana={y}-{w:02d}"
+    except Exception:
+        return "https://camara.cl/legislacion/comisiones/citaciones_semana.aspx"
+
+
+def _tg_boton(msg, url, label="🔗 Ver citacion completa"):
+    try:
+        db = firestore.Client(project=GCP_PROJECT)
+        chat_ids = _get_chat_ids(db)
+        for chat_id in chat_ids:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML",
+                      "reply_markup": {"inline_keyboard": [[{"text": label, "url": url}]]}},
+                timeout=10
+            )
+        log.info(f"[Telegram] Boton enviado a {len(chat_ids)} usuarios")
+    except Exception as e:
+        log.error(f"Error Telegram boton: {e}")
+
+
 def notificar_nueva(cit, en_resumen=False):
     """Solo notifica citaciones nuevas que NO estaban en el resumen semanal."""
     from zoneinfo import ZoneInfo
@@ -405,8 +435,8 @@ def notificar_nueva(cit, en_resumen=False):
         f"📍 {cit.sala[:60]}\n"
     )
     if tema:
-        msg += f"📌 {tema[:150]}"
-    _tg_texto(msg)
+        msg += f"📌 {tema[:500]}"
+    _tg_boton(msg, _url_citacion(cit))
 
 
 def notificar_cambio(cit, tipo, horario_anterior=""):
@@ -429,7 +459,7 @@ def notificar_cambio(cit, tipo, horario_anterior=""):
             f"📅 {cit.fecha}{cambio}\n"
             f"📍 {cit.sala[:50]}"
         )
-    _tg_texto(msg)
+    _tg_boton(msg, _url_citacion(cit))
 
 
 def notificar_inicios(db):
@@ -497,7 +527,7 @@ def llenar_sheets_semanal(db):
         except Exception:
             pass
         filas.append(["NO", inst, c.get("comision",""), fecha,
-                      c.get("horario",""), c.get("sala","")[:60], c.get("materia","")[:800]])
+                      c.get("horario",""), c.get("sala","")[:60], c.get("materia","")[:2000]])
     svc.spreadsheets().values().update(
         spreadsheetId=SHEETS_ID_FIJO, range="A1",
         valueInputOption="RAW", body={"values": cabecera + filas}
@@ -563,6 +593,16 @@ def llenar_sheets_semanal(db):
 
 
 # ── Cerrar semana ──────────────────────────────────────────────────────────────
+import unicodedata as _ud
+def _norm_comision(s):
+    s = _ud.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
+    s = s.lower().strip()
+    for p in ("s de ", "c de ", "comision de ", "comision ", "de "):
+        if s.startswith(p):
+            s = s[len(p):]
+            break
+    return " ".join(s.split())
+
 def cerrar_semana(db):
     svc = _sheets_svc()
     try:
@@ -592,7 +632,7 @@ def cerrar_semana(db):
         inst      = fila[1].strip() if len(fila) > 1 else ""
         comision  = fila[2].strip() if len(fila) > 2 else ""
         fecha_raw = fila[3].strip() if len(fila) > 3 else ""
-        fuente    = "senado" if "Senado" in inst else "camara"
+        fuente    = "senado" if "senado" in inst.lower() else "camara"
         fecha_iso = ""
         try:
             partes    = fecha_raw.split(" ")
@@ -601,8 +641,10 @@ def cerrar_semana(db):
             fecha_iso = dt.strftime("%Y-%m-%d")
         except Exception:
             pass
+        comision_n = _norm_comision(comision)
         for doc_id, c in cits_dict.items():
-            if (c.get("fuente") == fuente and c.get("comision") == comision and
+            if (c.get("fuente") == fuente and
+                    _norm_comision(c.get("comision","")) == comision_n and
                     (not fecha_iso or c.get("fecha") == fecha_iso)):
                 db.collection(FIRESTORE_COLECCION).document(doc_id).update({
                     "prioridad": True, "inicio_notificado": False,
@@ -762,7 +804,7 @@ def generar_pdf(cits, num_semana, fecha_inicio, fecha_fin):
 
                 info = [badge, Paragraph(comision, e_sname)]
                 if tema:
-                    info.append(Paragraph(tema[:800], e_stema))
+                    info.append(Paragraph(tema[:2000], e_stema))
 
                 card = Table([[Paragraph(horario, e_sts if es_s else e_stc), info]],
                     colWidths=[2.2*cm, INNER_W-2.8*cm])
@@ -880,8 +922,53 @@ def enviar_reporte_final(db, es_prueba=False):
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
+def limpiar_semana_anterior(db):
+    """Borra citaciones anteriores al lunes de la semana en curso y re-scrapea."""
+    hoy = datetime.now()
+    # Lunes de esta semana (si es domingo, apunta al lunes siguiente)
+    if hoy.weekday() == 6:          # domingo
+        lunes = hoy + timedelta(days=1)
+    else:
+        lunes = hoy - timedelta(days=hoy.weekday())
+    corte = lunes.strftime("%Y-%m-%d")
+
+    eliminadas = 0
+    for doc in db.collection(FIRESTORE_COLECCION).stream():
+        if doc.to_dict().get("fecha", "") < corte:
+            doc.reference.delete()
+            eliminadas += 1
+    log.info(f"Limpieza: {eliminadas} citaciones anteriores al {corte}")
+
+    todas = scrape_senado()
+    for sem in [semana_actual(), semana_siguiente()]:
+        todas += scrape_camara(semana=sem)
+    log.info(f"Re-scrapeo: {len(todas)} citaciones")
+
+    guardadas = 0
+    for cit in todas:
+        if cit.fecha < corte:
+            continue
+        db.collection(FIRESTORE_COLECCION).document(cit.id).set({
+            "fuente": cit.fuente, "comision": cit.comision,
+            "fecha": cit.fecha, "horario": cit.horario,
+            "sala": cit.sala, "materia": cit.materia,
+            "suspendida": cit.suspendida,
+            "hash_contenido": cit.hash_contenido(),
+            "prioridad": False, "inicio_notificado": False,
+            "en_resumen": False, "horario_anterior": cit.horario,
+        }, merge=True)
+        guardadas += 1
+    log.info(f"Limpieza+scrapeo completo: {guardadas} guardadas desde {corte}")
+    return guardadas
+
+
 def main(modo="monitor"):
     db = firestore.Client(project=GCP_PROJECT)
+
+    if modo == "limpiar":
+        log.info("Limpiando semana anterior + re-scrapeo...")
+        limpiar_semana_anterior(db)
+        return
 
     if modo == "sheets":
         log.info("Llenando Sheets...")

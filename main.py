@@ -168,6 +168,15 @@ def sheets():
         return jsonify({"status": "error", "detalle": str(e)}), 500
 
 
+@app.route("/limpiar", methods=["POST", "GET"])
+def limpiar():
+    try:
+        citaciones.main(modo="limpiar")
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "detalle": str(e)}), 500
+
+
 @app.route("/cerrar", methods=["POST", "GET"])
 def cerrar():
     try:
